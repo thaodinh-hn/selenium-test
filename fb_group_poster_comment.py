@@ -38,76 +38,30 @@ OPEN_COMPOSER_XPATHS = [
     ),
 ]
 
-POST_DIALOG_XPATHS = [
-    "//*[@role='dialog' and (@aria-label='Tạo bài viết' or @aria-label='Create post' or @aria-label='Create public post')]",
-    (
-        "//*[@role='dialog' and (.//*[self::h1 or self::h2 or self::span]"
-        "[normalize-space()='Tạo bài viết'"
-        " or normalize-space()='Create post'"
-        " or normalize-space()='Create public post'])]"
-    ),
-]
-
-GLOBAL_POST_EDITOR_XPATHS = [
-    (
-        "//*[@contenteditable='true' and @role='textbox' and @data-lexical-editor='true' and ("
-        "contains(@aria-placeholder, 'Tạo bài viết')"
-        " or contains(@aria-label, 'Tạo bài viết')"
-        " or contains(@aria-placeholder, 'Write something')"
-        " or contains(@aria-label, 'Write something')"
-        " or contains(@aria-placeholder, \"What's on your mind\")"
-        " or contains(@aria-label, \"What's on your mind\")"
-        " or contains(@aria-placeholder, 'Create public post')"
-        " or contains(@aria-label, 'Create public post')"
-        ")]"
-    ),
-    (
-        "//*[@contenteditable='true' and @role='textbox' and @data-lexical-editor='true' and not("
-        "contains(@aria-placeholder, 'Viết bình luận')"
-        " or contains(@aria-label, 'Viết bình luận')"
-        " or contains(@aria-placeholder, 'Write a comment')"
-        " or contains(@aria-label, 'Write a comment')"
-        ")]"
-    ),
-]
-
 EDITOR_XPATHS = [
-    ".//*[@contenteditable='true' and @role='textbox' and @data-lexical-editor='true']",
-    (
-        ".//*[@contenteditable='true' and @role='textbox' and ("
-        "contains(@aria-placeholder, 'Tạo bài viết')"
-        " or contains(@aria-placeholder, 'Write something')"
-        " or contains(@aria-placeholder, \"What's on your mind\")"
-        " or contains(@aria-placeholder, 'Create public post')"
-        ")]"
-    ),
-    ".//*[@contenteditable='true' and @role='textbox']",
-    ".//*[@contenteditable='true' and (@role='textbox' or @aria-multiline='true')]",
+    "//*[@role='dialog']//div[@role='textbox' and @contenteditable='true']",
+    "//*[@role='dialog']//*[@contenteditable='true' and (@role='textbox' or @aria-multiline='true')]",
+    "//div[@role='textbox' and @contenteditable='true']",
+    "//*[@contenteditable='true' and (@role='textbox' or @aria-multiline='true')]",
 ]
 
 PUBLISH_BUTTON_XPATHS = [
     (
-        ".//*[@role='button' and ("
+        "//*[@role='dialog']//*[@role='button' and ("
         "@aria-label='Đăng' or @aria-label='Post' or @aria-label='Đăng bài'"
         ")]"
     ),
     (
-        ".//*[@role='button']["
+        "//*[@role='dialog']//*[@role='button']["
         ".//*[self::span or self::div][normalize-space()='Đăng'"
         " or normalize-space()='Post'"
         " or normalize-space()='Đăng bài']"
         "]"
     ),
-]
-
-GLOBAL_PUBLISH_BUTTON_XPATHS = [
-    "//*[@role='button' and (@aria-label='Đăng' or @aria-label='Post' or @aria-label='Đăng bài')]",
     (
-        "//*[@role='button']["
-        ".//*[self::span or self::div][normalize-space()='Đăng'"
-        " or normalize-space()='Post'"
-        " or normalize-space()='Đăng bài']"
-        "]"
+        "//*[@role='button' and ("
+        "@aria-label='Đăng' or @aria-label='Post' or @aria-label='Đăng bài'"
+        ")]"
     ),
 ]
 
@@ -208,29 +162,15 @@ def is_enabled(element: Any) -> bool:
 
 
 def find_first_matching_element(
-    search_context: Any,
+    driver: Any,
     xpaths: list[str],
     *,
     require_enabled: bool = False,
 ) -> Any | None:
     from selenium.webdriver.common.by import By
-    from selenium.common.exceptions import StaleElementReferenceException
-
-    try:
-        current_context = search_context() if callable(search_context) else search_context
-    except StaleElementReferenceException:
-        return None
-
-    if current_context is None:
-        return None
 
     for xpath in xpaths:
-        try:
-            elements = current_context.find_elements(By.XPATH, xpath)
-        except StaleElementReferenceException:
-            return None
-
-        for element in elements:
+        for element in driver.find_elements(By.XPATH, xpath):
             try:
                 if not element.is_displayed():
                     continue
@@ -243,18 +183,17 @@ def find_first_matching_element(
 
 
 def wait_for_element(
-    search_context: Any,
+    driver: Any,
     xpaths: list[str],
     *,
     timeout: float,
     label: str,
     require_enabled: bool = False,
-    debug_driver: Any | None = None,
 ) -> Any:
     deadline = time.time() + timeout
     while time.time() < deadline:
         element = find_first_matching_element(
-            search_context,
+            driver,
             xpaths,
             require_enabled=require_enabled,
         )
@@ -262,11 +201,10 @@ def wait_for_element(
             return element
         time.sleep(0.5)
 
-    active_driver = debug_driver or search_context
-    screenshot_path, html_path = dump_debug(active_driver, f"fb_group_poster_{label}")
+    screenshot_path, html_path = dump_debug(driver, f"fb_group_poster_{label}")
     raise RuntimeError(
         f"Could not find {label}. "
-        f"Current URL: {active_driver.current_url}. "
+        f"Current URL: {driver.current_url}. "
         f"Saved screenshot to {screenshot_path} and HTML to {html_path}."
     )
 
@@ -296,10 +234,6 @@ def open_group_post_composer(driver: Any, *, timeout: float) -> None:
     click_element(driver, button)
 
 
-def build_post_dialog_provider(driver: Any):
-    return lambda: find_first_matching_element(driver, POST_DIALOG_XPATHS)
-
-
 def fill_editor_with_js(driver: Any, editor: Any, message: str) -> None:
     driver.execute_script(
         """
@@ -310,27 +244,12 @@ def fill_editor_with_js(driver: Any, editor: Any, message: str) -> None:
             element.click();
         }
 
-        const setSelectionToEnd = () => {
-            const selection = window.getSelection();
-            const range = document.createRange();
-            range.selectNodeContents(element);
-            range.collapse(false);
-            selection.removeAllRanges();
-            selection.addRange(range);
-        };
-
         const tryExecCommand = () => {
             if (!document.execCommand) {
                 return false;
             }
             try {
-                setSelectionToEnd();
-                element.dispatchEvent(new InputEvent('beforeinput', {
-                    bubbles: true,
-                    cancelable: true,
-                    inputType: 'insertText',
-                    data: text,
-                }));
+                document.execCommand('selectAll', false, null);
                 return document.execCommand('insertText', false, text);
             } catch (error) {
                 return false;
@@ -351,21 +270,6 @@ def fill_editor_with_js(driver: Any, editor: Any, message: str) -> None:
         editor,
         message,
     )
-
-
-def get_editor_text(editor: Any) -> str:
-    text = editor.get_attribute("textContent") or ""
-    if not text.strip():
-        text = editor.text or ""
-    return text
-
-
-def editor_contains_message(editor: Any, message: str) -> bool:
-    normalized_message = clean_text(message)
-    normalized_editor = clean_text(get_editor_text(editor))
-    if not normalized_message:
-        return False
-    return normalized_message == normalized_editor or normalized_message in normalized_editor
 
 
 def fill_editor_with_keys(driver: Any, editor: Any, message: str) -> None:
@@ -400,7 +304,7 @@ def fill_editor_with_keys(driver: Any, editor: Any, message: str) -> None:
 
 
 def wait_for_optional_element(
-    search_context: Any,
+    driver: Any,
     xpaths: list[str],
     *,
     timeout: float,
@@ -409,7 +313,7 @@ def wait_for_optional_element(
     deadline = time.time() + timeout
     while time.time() < deadline:
         element = find_first_matching_element(
-            search_context,
+            driver,
             xpaths,
             require_enabled=require_enabled,
         )
@@ -426,94 +330,31 @@ def fill_post_editor(
     timeout: float,
     require_publish_button: bool,
 ) -> None:
-    dialog_provider = build_post_dialog_provider(driver)
-    editor = wait_for_optional_element(
+    editor = wait_for_element(
         driver,
-        GLOBAL_POST_EDITOR_XPATHS,
-        timeout=min(timeout, 6.0),
-    )
-    if editor is None:
-        editor = wait_for_element(
-            dialog_provider,
-            EDITOR_XPATHS,
-            timeout=timeout,
-            label="editor",
-            debug_driver=driver,
-        )
-    fill_editor_with_js(driver, editor, message)
-    time.sleep(1)
-    editor = wait_for_optional_element(
-        driver,
-        GLOBAL_POST_EDITOR_XPATHS,
-        timeout=min(timeout, 4.0),
-    ) or wait_for_element(
-        dialog_provider,
         EDITOR_XPATHS,
         timeout=timeout,
-        label="editor_after_js",
-        debug_driver=driver,
+        label="editor",
     )
-
-    if not editor_contains_message(editor, message):
-        editor = wait_for_optional_element(
-            driver,
-            GLOBAL_POST_EDITOR_XPATHS,
-            timeout=min(timeout, 4.0),
-        ) or wait_for_element(
-            dialog_provider,
-            EDITOR_XPATHS,
-            timeout=timeout,
-            label="editor_before_keys",
-            debug_driver=driver,
-        )
-        fill_editor_with_keys(driver, editor, message)
-        time.sleep(1)
-        editor = wait_for_optional_element(
-            driver,
-            GLOBAL_POST_EDITOR_XPATHS,
-            timeout=min(timeout, 4.0),
-        ) or wait_for_element(
-            dialog_provider,
-            EDITOR_XPATHS,
-            timeout=timeout,
-            label="editor_after_keys",
-            debug_driver=driver,
-        )
-
-    if not editor_contains_message(editor, message):
-        screenshot_path, html_path = dump_debug(driver, "fb_group_poster_editor_text_mismatch")
-        raise RuntimeError(
-            "The post editor was found, but the message was not inserted into that editor. "
-            f"Saved screenshot to {screenshot_path} and HTML to {html_path}."
-        )
+    fill_editor_with_js(driver, editor, message)
+    time.sleep(1)
 
     if not require_publish_button:
         return
 
     publish_button = wait_for_optional_element(
         driver,
-        GLOBAL_PUBLISH_BUTTON_XPATHS,
+        PUBLISH_BUTTON_XPATHS,
         timeout=min(timeout, 4.0),
         require_enabled=True,
     )
     if publish_button is None:
-        editor = wait_for_optional_element(
-            driver,
-            GLOBAL_POST_EDITOR_XPATHS,
-            timeout=min(timeout, 4.0),
-        ) or wait_for_element(
-            dialog_provider,
-            EDITOR_XPATHS,
-            timeout=timeout,
-            label="editor_before_publish_retry",
-            debug_driver=driver,
-        )
         fill_editor_with_keys(driver, editor, message)
         time.sleep(1)
 
     publish_button = wait_for_optional_element(
         driver,
-        GLOBAL_PUBLISH_BUTTON_XPATHS,
+        PUBLISH_BUTTON_XPATHS,
         timeout=min(timeout, 6.0),
         require_enabled=True,
     )
@@ -533,22 +374,13 @@ def fill_post_editor(
 
 
 def publish_post(driver: Any, *, timeout: float) -> None:
-    button = wait_for_optional_element(
+    button = wait_for_element(
         driver,
-        GLOBAL_PUBLISH_BUTTON_XPATHS,
-        timeout=min(timeout, 6.0),
+        PUBLISH_BUTTON_XPATHS,
+        timeout=timeout,
+        label="publish_button",
         require_enabled=True,
     )
-    if button is None:
-        dialog_provider = build_post_dialog_provider(driver)
-        button = wait_for_element(
-            dialog_provider,
-            PUBLISH_BUTTON_XPATHS,
-            timeout=timeout,
-            label="publish_button",
-            require_enabled=True,
-            debug_driver=driver,
-        )
     click_element(driver, button)
 
 

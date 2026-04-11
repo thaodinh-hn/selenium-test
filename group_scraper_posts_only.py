@@ -221,6 +221,7 @@ def scrape_multiple_groups_only(
     group_urls: list[str],
     cookies: list[dict[str, str]],
     *,
+    output_path: str | Path | None = None,
     max_posts: int,
     max_scrolls: int,
     min_delay: float,
@@ -228,20 +229,46 @@ def scrape_multiple_groups_only(
     headless: bool = False,
 ) -> list[dict[str, str]]:
     all_posts: dict[str, dict[str, str]] = {}
+    failed_groups: list[tuple[str, str]] = []
+    resolved_output_path = Path(output_path).resolve() if output_path is not None else None
 
     for index, group_url in enumerate(group_urls, start=1):
         print(f"Starting group {index}/{len(group_urls)}: {group_url}")
-        group_posts = scrape_group_posts_only(
-            group_url,
-            cookies,
-            max_posts=max_posts,
-            max_scrolls=max_scrolls,
-            min_delay=min_delay,
-            max_delay=max_delay,
-            headless=headless,
-        )
+        try:
+            group_posts = scrape_group_posts_only(
+                group_url,
+                cookies,
+                max_posts=max_posts,
+                max_scrolls=max_scrolls,
+                min_delay=min_delay,
+                max_delay=max_delay,
+                headless=headless,
+            )
+        except Exception as exc:
+            failed_groups.append((group_url, str(exc)))
+            print(f"Failed group {group_url}: {exc}")
+            continue
+
+        new_posts = 0
         for post in group_posts:
-            all_posts.setdefault(post["post_key"], post)
+            if post["post_key"] in all_posts:
+                continue
+            all_posts[post["post_key"]] = post
+            new_posts += 1
+
+        print(
+            f"Finished group {index}/{len(group_urls)}: kept {new_posts} new posts, "
+            f"{len(all_posts)} unique posts total"
+        )
+
+        if resolved_output_path is not None and all_posts:
+            write_posts_to_csv(list(all_posts.values()), resolved_output_path)
+            print(f"Saved interim results to {resolved_output_path}")
+
+    if failed_groups:
+        print("Finished with failed groups:")
+        for group_url, error_message in failed_groups:
+            print(f"- {group_url}: {error_message}")
 
     return list(all_posts.values())
 
@@ -259,12 +286,16 @@ def main() -> None:
     posts = scrape_multiple_groups_only(
         group_urls,
         cookies,
+        output_path=args.output,
         max_posts=args.max_posts,
         max_scrolls=args.max_scrolls,
         min_delay=args.min_delay,
         max_delay=args.max_delay,
         headless=args.headless,
     )
+    if not posts:
+        raise SystemExit("No post bodies were collected from any group.")
+
     write_posts_to_csv(posts, args.output)
     print(
         f"Saved {len(posts)} post bodies from {len(group_urls)} group(s) to {Path(args.output).resolve()}"
