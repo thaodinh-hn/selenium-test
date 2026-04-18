@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import group_scraper
+import scrape_features.group_posts.scraper as group_scraper
 
 
 class CleanTextTests(unittest.TestCase):

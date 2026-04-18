@@ -35,7 +35,9 @@ def write_posts_to_csv(posts: list[dict[str, str]], output_path: str | Path) -> 
         "group_url",
         "scraped_at_utc",
     ]
-    with Path(output_path).open("w", encoding="utf-8-sig", newline="") as csv_file:
+    resolved_output_path = Path(output_path)
+    resolved_output_path.parent.mkdir(parents=True, exist_ok=True)
+    with resolved_output_path.open("w", encoding="utf-8-sig", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(posts)
@@ -75,7 +77,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="group_posts.csv",
+        default="scrape_features/group_posts/data/group_posts.csv",
         help="CSV file to write scraped posts to.",
     )
     parser.add_argument(
@@ -243,6 +245,8 @@ def random_pause(min_delay: float, max_delay: float, scroll_index: int) -> None:
 def dump_debug(driver, prefix: str) -> tuple[Path, Path]:
     screenshot_path = Path(f"{prefix}.png").resolve()
     html_path = Path(f"{prefix}.html").resolve()
+    screenshot_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path.parent.mkdir(parents=True, exist_ok=True)
     driver.save_screenshot(str(screenshot_path))
     html_path.write_text(driver.page_source, encoding="utf-8")
     return screenshot_path, html_path
@@ -306,7 +310,9 @@ def scrape_group_posts(
             random_pause(min_delay, max_delay, scroll_index)
 
         if not posts_by_key:
-            screenshot_path, html_path = dump_debug(driver, "group_scraper_empty")
+            screenshot_path, html_path = dump_debug(
+                driver, "scrape_features/group_posts/debug/group_scraper_empty"
+            )
             raise RuntimeError(
                 "No posts were collected. "
                 f"Saved screenshot to {screenshot_path} and HTML to {html_path}."

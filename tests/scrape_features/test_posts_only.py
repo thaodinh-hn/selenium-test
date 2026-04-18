@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
-import group_scraper_posts_only
+import scrape_features.posts_only.scraper as group_scraper_posts_only
 
 
 class MergeContentBlocksTests(unittest.TestCase):

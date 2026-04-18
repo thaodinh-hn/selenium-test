@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from group_scraper import (
+from scrape_features.group_posts.scraper import (
     DEFAULT_GROUP_URL,
     build_post_key,
     clean_text,
@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="group_posts_only.csv",
+        default="scrape_features/posts_only/data/group_posts_only.csv",
         help="CSV file to write scraped posts to.",
     )
     parser.add_argument(
@@ -206,7 +206,9 @@ def scrape_group_posts_only(
             random_pause(min_delay, max_delay, scroll_index)
 
         if not posts_by_key:
-            screenshot_path, html_path = dump_debug(driver, "group_scraper_posts_only_empty")
+            screenshot_path, html_path = dump_debug(
+                driver, "scrape_features/posts_only/debug/group_scraper_posts_only_empty"
+            )
             raise RuntimeError(
                 "No post-body content was collected. "
                 f"Saved screenshot to {screenshot_path} and HTML to {html_path}."

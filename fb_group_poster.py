@@ -5,8 +5,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-from group_scraper import clean_text, close_popups, dump_debug, login_with_cookies
+from scrape_features.group_posts.scraper import clean_text, close_popups, dump_debug, login_with_cookies
 from main import build_driver, convert_raw_cookie
+
+
+DEBUG_OUTPUT_PREFIX = "scrape_features/group_posts/debug/fb_group_poster"
 
 
 OPEN_COMPOSER_XPATHS = [
@@ -263,7 +266,7 @@ def wait_for_element(
         time.sleep(0.5)
 
     active_driver = debug_driver or search_context
-    screenshot_path, html_path = dump_debug(active_driver, f"fb_group_poster_{label}")
+    screenshot_path, html_path = dump_debug(active_driver, f"{DEBUG_OUTPUT_PREFIX}_{label}")
     raise RuntimeError(
         f"Could not find {label}. "
         f"Current URL: {active_driver.current_url}. "
@@ -481,7 +484,7 @@ def fill_post_editor(
         )
 
     if not editor_contains_message(editor, message):
-        screenshot_path, html_path = dump_debug(driver, "fb_group_poster_editor_text_mismatch")
+        screenshot_path, html_path = dump_debug(driver, f"{DEBUG_OUTPUT_PREFIX}_editor_text_mismatch")
         raise RuntimeError(
             "The post editor was found, but the message was not inserted into that editor. "
             f"Saved screenshot to {screenshot_path} and HTML to {html_path}."
@@ -518,7 +521,7 @@ def fill_post_editor(
         require_enabled=True,
     )
     if publish_button is None:
-        screenshot_path, html_path = dump_debug(driver, "fb_group_poster_publish_not_ready")
+        screenshot_path, html_path = dump_debug(driver, f"{DEBUG_OUTPUT_PREFIX}_publish_not_ready")
         note = ""
         if contains_non_bmp_characters(message):
             note = (
