@@ -8,7 +8,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from main import build_driver, convert_raw_cookie
+from main import build_driver, convert_raw_cookie, login_with_cookies as shared_login_with_cookies
 
 
 DEFAULT_GROUP_URL = "https://www.facebook.com/groups/1250416722544463/"
@@ -111,17 +111,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def login_with_cookies(driver, cookies: list[dict[str, str]]) -> None:
-    driver.get("https://www.facebook.com/")
-    time.sleep(2)
-
-    for cookie in cookies:
-        try:
-            driver.add_cookie(cookie)
-        except Exception as exc:  # pragma: no cover
-            print(f"Skipped cookie {cookie['name']}: {exc}")
-
-    driver.get("https://www.facebook.com/")
-    time.sleep(3)
+    shared_login_with_cookies(driver, cookies)
 
 
 def close_popups(driver) -> None:

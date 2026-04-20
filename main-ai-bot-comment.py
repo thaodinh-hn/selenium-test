@@ -1,339 +1,446 @@
+from __future__ import annotations
+
+import argparse
 import os
-import random
+import re
 import time
-import logging
-from datetime import datetime
+from pathlib import Path
+from typing import Any
 
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    TimeoutException,
-    NoSuchElementException
-)
-from webdriver_manager.chrome import ChromeDriverManager
-import openai
-import os
-from dotenv import load_dotenv
+from main import build_driver, convert_raw_cookie
+from scrape_features.group_posts.scraper import clean_text, close_popups, dump_debug, login_with_cookies
 
-load_dotenv()
 
-CONFIG = {
-    'POST_URL': os.getenv('POST_URL'),
-    # Change 'Write a comment...' to your language in Facebook settings like 'Comment as Nguyen Duy' or 'Viết bình luận...'
-    'COMMENT_BOX_XPATH': "//div[contains(@aria-label, 'Write a comment') and @contenteditable='true']",
-    'MAX_COMMENTS': 100,
-    'MAX_ITERATIONS': 10000,
-    'DELAYS': {
-        'SHORT_MIN': 0.5,
-        'SHORT_MAX': 2.0,
-        'MEDIUM_MIN': 1,
-        'MEDIUM_MAX': 3,
-        'LONG_MIN': 5,
-        'LONG_MAX': 20,
-        'RELOAD_PAUSE': 180,
-    },
-    'CHROME_PROFILE': 'Default'
-}
+DEBUG_OUTPUT_PREFIX = "scrape_features/comment_replies/debug/manual_comment"
 
-OPENAI_CONFIG = {
-    'API_KEY': os.getenv('OPENAI_API_KEY'),
-    'MODEL': os.getenv('OPENAI_MODEL'),
-    'PROMPT': os.getenv('OPENAI_PROMPT') + 'Do not include emojis or any introductory phrases or additional text.'
-}
+COMMENT_EDITOR_XPATHS = [
+    (
+        "//*[@role='textbox' and @contenteditable='true' and ("
+        "contains(@aria-label, 'Viết bình luận')"
+        " or contains(@aria-label, 'Write a comment')"
+        " or contains(@aria-label, 'Write a public comment')"
+        " or contains(@aria-label, 'Viết câu trả lời')"
+        " or contains(@aria-label, 'Write a reply')"
+        " or contains(@aria-placeholder, 'Viết bình luận')"
+        " or contains(@aria-placeholder, 'Write a comment')"
+        " or contains(@aria-placeholder, 'Viết câu trả lời')"
+        " or contains(@aria-placeholder, 'Write a reply')"
+        ")]"
+    ),
+    "//*[@role='textbox' and @contenteditable='true']",
+]
 
-def setup_logger():
-    """
-    Set up comprehensive logging configuration.
-    """
-    os.makedirs('logs', exist_ok=True)
-    log_filename = f'logs/facebook_comment_bot_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+COMMENT_TRIGGER_XPATHS = [
+    (
+        "//*[@role='button' and ("
+        "contains(@aria-label, 'Bình luận')"
+        " or contains(@aria-label, 'Comment')"
+        ")]"
+    ),
+    (
+        "//*[@role='button'][.//*[self::span or self::div]["
+        "normalize-space()='Bình luận' or normalize-space()='Comment'"
+        "]]"
+    ),
+]
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s: %(message)s',
-        handlers=[
-            logging.FileHandler(log_filename, encoding='utf-8'),
-            logging.StreamHandler()
-        ]
+POST_URL_HINT_PATTERN = re.compile(r"/posts/|story_fbid=|/permalink/")
+AI_SUFFIX = "Do not include emojis or any introductory phrases or additional text."
+
+
+class CommentBotError(RuntimeError):
+    pass
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Log in to Facebook with cookies and prepare or publish a single comment on a target post URL."
+        )
     )
-    return logging.getLogger(__name__)
+    parser.add_argument(
+        "--cookie-file",
+        default="fb_cookie.txt",
+        help="Path to a raw Facebook cookie string file.",
+    )
+    parser.add_argument(
+        "--post-url",
+        required=True,
+        help="Facebook post URL where the comment should be added.",
+    )
 
-logger = setup_logger()
+    comment_group = parser.add_mutually_exclusive_group(required=True)
+    comment_group.add_argument(
+        "--comment",
+        help="Inline comment content.",
+    )
+    comment_group.add_argument(
+        "--comment-file",
+        help="Path to a UTF-8 text file containing the comment content.",
+    )
+    comment_group.add_argument(
+        "--use-ai",
+        action="store_true",
+        help="Generate comment content from OpenAI using OPENAI_* env vars or the --ai-* flags.",
+    )
 
-class FacebookAICommentBot:
-    def __init__(self, config=None):
-        """
-        Initialize the Facebook comment bot with configuration.
-        """
-        self.config = {**CONFIG, **(config or {})}
-        self.driver = None
+    parser.add_argument(
+        "--publish",
+        action="store_true",
+        help="Actually submit the comment. Without this flag, the script stops after filling the editor.",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run Chrome in headless mode.",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=20.0,
+        help="Maximum seconds to wait for Facebook UI elements.",
+    )
+    parser.add_argument(
+        "--page-load-wait",
+        type=float,
+        default=5.0,
+        help="Seconds to wait after opening the post page.",
+    )
+    parser.add_argument(
+        "--ai-model",
+        default=os.getenv("OPENAI_MODEL", ""),
+        help="OpenAI model to use when --use-ai is enabled.",
+    )
+    parser.add_argument(
+        "--ai-prompt",
+        default=os.getenv("OPENAI_PROMPT", ""),
+        help="Prompt used to generate comment content when --use-ai is enabled.",
+    )
+    return parser.parse_args()
 
-        openai.api_key = OPENAI_CONFIG['API_KEY']
 
-    def setup_driver(self):
-        """
-        Sets up and configures the Selenium WebDriver.
-        """
-        try:
-            chrome_options = Options()
-            chrome_options.add_argument("--disable-popup-blocking")
-            chrome_options.add_argument("--disable-notifications")
-            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-            chrome_options.add_experimental_option('useAutomationExtension', False)
+def resolve_comment_text(comment: str | None, comment_file: str | None) -> str:
+    if comment_file:
+        content = Path(comment_file).read_text(encoding="utf-8")
+    elif comment is not None:
+        content = comment
+    else:  # pragma: no cover
+        raise ValueError("Either comment or comment_file must be provided.")
 
-            # Set Chrome binary location (adjust as needed)
-            chrome_options.binary_location = "C:/Program Files/Google/Chrome/Application/chrome.exe"
+    normalized = content.replace("\r\n", "\n").strip()
+    if not clean_text(normalized):
+        raise ValueError("Comment content is empty.")
 
-            # Create a custom user-data dir (so we don't need your real profile path)
-            user_data_dir = os.path.join(os.getcwd(), "chrome_data")
-            chrome_options.add_argument(f"--user-data-dir={user_data_dir}")
-            chrome_options.add_argument(f"--profile-directory={self.config['CHROME_PROFILE']}")
+    return normalized
 
-            service = Service(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            logger.info("Chrome driver set up successfully.")
-        except Exception as e:
-            logger.error(f"Failed to setup Chrome Driver: {e}")
-            raise
 
-    def random_pause(self, min_time=1, max_time=5):
-        """
-        Pause execution for a random duration between min_time and max_time seconds.
-        """
-        delay = random.uniform(min_time, max_time)
-        time.sleep(delay)
-        logger.debug(f"Paused for {delay:.2f} seconds.")
+def build_ai_prompt(prompt: str) -> str:
+    normalized = prompt.strip()
+    if not normalized:
+        raise ValueError("OPENAI_PROMPT or --ai-prompt is required when --use-ai is enabled.")
 
-    def human_mouse_jiggle(self, element, moves=2):
-        """
-        Simulate human-like mouse movements over a given element.
+    if AI_SUFFIX in normalized:
+        return normalized
+    return f"{normalized}\n{AI_SUFFIX}"
 
-        Args:
-            element: The web element to move the mouse over.
-            moves: Number of jiggle movements.
-        """
-        try:
-            actions = ActionChains(self.driver)
-            actions.move_to_element(element).perform()
 
-            for _ in range(moves):
-                x_offset = random.randint(-15, 15)
-                y_offset = random.randint(-15, 15)
-                actions.move_by_offset(x_offset, y_offset).perform()
-                self.random_pause(0.3, 1)
+def generate_ai_comment(prompt: str, model: str) -> str:
+    api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY is required when --use-ai is enabled.")
+    if not model.strip():
+        raise ValueError("OPENAI_MODEL or --ai-model is required when --use-ai is enabled.")
 
-            # Return to the element
-            actions.move_to_element(element).perform()
-            self.random_pause(0.3, 1)
-            logger.debug(f"Performed mouse jiggle with {moves} moves.")
-        except Exception as e:
-            logger.error(f"Mouse jiggle failed: {e}")
+    final_prompt = build_ai_prompt(prompt)
 
-    def human_type(self, element, text):
-        """
-        Simulate human-like typing into a web element.
-
-        Args:
-            element: The web element to type into.
-            text: The text to type.
-        """
-        words = text.split()
-        for w_i, word in enumerate(words):
-            # Introduce random fake words
-            if random.random() < 0.05:
-                fake_word = random.choice(["aaa", "zzz", "hmm"])
-                for c in fake_word:
-                    element.send_keys(c)
-                    time.sleep(random.uniform(0.08, 0.35))
-                for _ in fake_word:
-                    element.send_keys(Keys.BACKSPACE)
-                    time.sleep(random.uniform(0.06, 0.25))
-
-            for char in word:
-                if random.random() < 0.05:
-                    wrong_char = random.choice("abcdefghijklmnopqrstuvwxyz")
-                    element.send_keys(wrong_char)
-                    time.sleep(random.uniform(0.08, 0.35))
-                    element.send_keys(Keys.BACKSPACE)
-                    time.sleep(random.uniform(0.06, 0.25))
-                element.send_keys(char)
-                time.sleep(random.uniform(0.08, 0.35))
-
-            if w_i < len(words) - 1:
-                element.send_keys(" ")
-                time.sleep(random.uniform(0.08, 0.3))
-
-            # random cursor movements
-            if random.random() < 0.03:
-                element.send_keys(Keys.ARROW_LEFT)
-                time.sleep(random.uniform(0.1, 0.3))
-                element.send_keys(Keys.ARROW_RIGHT)
-                time.sleep(random.uniform(0.1, 0.3))
-
-        self.random_pause(0.5, 1.5)
-        logger.debug("Completed human-like typing.")
-
-    def random_scroll(self):
-        """
-        Scroll up/down randomly to mimic a user's reading or browsing.
-        """
-        scroll_direction = random.choice(["up", "down"])
-        scroll_distance = random.randint(200, 800)
-
-        if scroll_direction == "down":
-            self.driver.execute_script(f"window.scrollBy(0, {scroll_distance});")
-            logger.debug(f"Scrolling down {scroll_distance} pixels.")
-        else:
-            self.driver.execute_script(f"window.scrollBy(0, -{scroll_distance});")
-            logger.debug(f"Scrolling up {scroll_distance} pixels.")
-
-        self.random_pause(1, 3)
-
-    def random_hover_or_click(self):
-        """
-        Randomly hover or click on some links or elements on the page to mimic user exploration.
-        """
-        all_links = self.driver.find_elements(By.TAG_NAME, "a")
-        if not all_links:
-            return
-
-        if random.random() < 0.5:
-            random_link = random.choice(all_links)
-            try:
-                actions = ActionChains(self.driver)
-                actions.move_to_element(random_link).perform()
-                logger.debug("Hovering over a random link.")
-                self.random_pause(1, 3)
-
-                if random.random() < 0.2:
-                    random_link.click()
-                    logger.debug("Clicked a random link. Going back in 3 seconds.")
-                    time.sleep(3)
-                    self.driver.back()
-                    self.random_pause(1, 3)
-            except Exception as e:
-                logger.debug(f"Random hover/click failed: {e}")
-
-    def generate_comment(self) -> str:
-        """
-        Use OpenAI API to generate a random, personalized comment.
-        """
-        try:
-            prompt = OPENAI_CONFIG['PROMPT']
-            response = openai.ChatCompletion.create(
-                model=OPENAI_CONFIG['MODEL'],
-                messages=[{"role": "user", "content": prompt}],
-            )
-            comment = response.choices[0].message['content'].strip()
-            logger.info(f"Generated comment: {comment}")
-            return comment
-        except Exception as e:
-            logger.error(f"Failed to generate comment: {e}")
-            # Default fallback comment if OpenAI fails
-            return "Such a thoughtful post! Thanks for sharing! 😊"
-
-    def post_comment(self, comment: str, comment_count: int):
-        """
-        Locate the comment box, click it, and post a comment with "human-like" actions.
-        """
-        try:
-            comment_area = WebDriverWait(self.driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, self.config['COMMENT_BOX_XPATH']))
-            )
-
-            # Random scroll or random hover before posting the comment
-            if random.random() < 0.4:
-                self.random_scroll()
-            else:
-                self.random_hover_or_click()
-
-            # Human-like mouse movements before clicking
-            self.human_mouse_jiggle(comment_area, moves=3)
-
-            # Click inside the comment box
-            comment_area.click()
-            self.random_pause(0.5, 2.0)
-
-            # Human-like typing into the comment box
-            self.human_type(comment_area, comment)
-            self.random_pause(0.5, 2.0)
-
-            # Submit the comment (press Enter)
-            comment_area.send_keys(Keys.RETURN)
-            self.random_pause(0.5, 2.0)
-
-            logger.info(f"Comment {comment_count} posted: '{comment}'")
-        except TimeoutException:
-            logger.warning(f"Comment {comment_count} posting timeout - element not found")
-            raise
-        except NoSuchElementException:
-            logger.warning(f"Comment {comment_count} posting element not found")
-            raise
-        except Exception as e:
-            logger.error(f"Error during comment posting for comment count {comment_count}: {e}")
-            raise
-
-    def run(self):
-        """
-        Main method to execute the Facebook comment bot with human-like actions.
-        """
-        try:
-            self.setup_driver()
-            self.driver.get(self.config['POST_URL'])
-            logger.info(f"Loaded Facebook post URL: {self.config['POST_URL']}")
-
-            comment_count = 0
-
-            for i in range(self.config['MAX_ITERATIONS']):
-                # Stop if we've hit the maximum comment limit
-                if comment_count >= self.config['MAX_COMMENTS']:
-                    logger.info("Max comments reached.")
-                    break
-
-                self.random_pause(0.5, 2.0)
-
-                # Occasional "idle time" as if the user is reading or distracted
-                if random.random() < 0.2:
-                    idle_time = random.randint(5, 10)
-                    logger.debug(f"Idling for {idle_time} seconds.")
-                    time.sleep(idle_time)
-
-                # Generate comment using OpenAI
-                comment = self.generate_comment()
-
-                try:
-                    self.post_comment(comment, comment_count + 1)
-                    comment_count += 1
-                except Exception as e:
-                    logger.warning(f"Iteration {i+1} failed to post comment: {e}")
-
-                # Every 30 comments, refresh and take a longer pause
-                if comment_count % 30 == 0 and comment_count != 0:
-                    logger.info(f"Comment count: {comment_count}. Refreshing page.")
-                    self.driver.refresh()
-                    self.random_pause(self.config['DELAYS']['RELOAD_PAUSE'] - 10, self.config['DELAYS']['RELOAD_PAUSE'] + 10)  # Adding some randomness to the pause
-        except Exception as e:
-            logger.critical(f"Bot execution failed: {e}")
-        finally:
-            if self.driver:
-                self.driver.quit()
-                logger.info("Browser closed.")
-
-def main():
-    """
-    Main function for the Facebook comment bot.
-    """
     try:
-        bot = FacebookAICommentBot()
-        bot.run()
-    except Exception as e:
-        logger.critical(f"Bot initialization failed: {e}")
+        from openai import OpenAI
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError(
+            "openai package is not installed. Install it before using --use-ai."
+        ) from exc
+
+    client = OpenAI(api_key=api_key)
+    response = client.responses.create(
+        model=model,
+        input=final_prompt,
+    )
+    comment = clean_text((response.output_text or "").strip())
+    if not comment:
+        raise RuntimeError("OpenAI returned an empty comment.")
+    return comment
+
+
+def resolve_runtime_comment(args: argparse.Namespace) -> str:
+    if args.use_ai:
+        return generate_ai_comment(args.ai_prompt, args.ai_model)
+    return resolve_comment_text(args.comment, args.comment_file)
+
+
+def wait_for_element(driver: Any, xpaths: list[str], *, timeout: float, label: str) -> Any:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for xpath in xpaths:
+            for element in driver.find_elements("xpath", xpath):
+                try:
+                    if element.is_displayed():
+                        return element
+                except Exception:  # pragma: no cover
+                    continue
+        time.sleep(0.5)
+
+    screenshot_path, html_path = dump_debug(driver, f"{DEBUG_OUTPUT_PREFIX}_{label}")
+    raise CommentBotError(
+        f"Could not find {label}. Current URL: {driver.current_url}. "
+        f"Saved screenshot to {screenshot_path} and HTML to {html_path}."
+    )
+
+
+def click_element(driver: Any, element: Any) -> None:
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+        element,
+    )
+    try:
+        element.click()
+        return
+    except Exception:
+        driver.execute_script("arguments[0].click();", element)
+
+
+def is_login_required(driver: Any) -> bool:
+    return bool(driver.find_elements("xpath", "//input[@name='email' or @name='pass']"))
+
+
+def looks_like_post_url(url: str) -> bool:
+    return bool(POST_URL_HINT_PATTERN.search(url))
+
+
+def ensure_post_context(driver: Any, expected_post_url: str) -> None:
+    current_url = clean_text(driver.current_url)
+    if not current_url:
+        raise CommentBotError("Browser has empty current URL.")
+    if is_login_required(driver):
+        raise CommentBotError(
+            "Facebook redirected to login page; cookie session is not active."
+        )
+    if looks_like_post_url(expected_post_url) and not looks_like_post_url(current_url):
+        raise CommentBotError(
+            f"Expected post URL but browser was redirected to: {current_url}"
+        )
+
+
+def click_comment_trigger_if_available(driver: Any, *, timeout: float) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        for xpath in COMMENT_TRIGGER_XPATHS:
+            for button in driver.find_elements("xpath", xpath):
+                try:
+                    if not button.is_displayed():
+                        continue
+                    click_element(driver, button)
+                    return
+                except Exception:  # pragma: no cover
+                    continue
+        time.sleep(0.3)
+
+
+def dismiss_blocking_dialogs(driver: Any) -> None:
+    close_popups(driver)
+
+    close_button_xpaths = [
+        (
+            "//*[@role='dialog']//*[@role='button' and ("
+            "@aria-label='Đóng' or @aria-label='Close'"
+            ")]"
+        ),
+        (
+            "//*[@role='dialog']//*[@aria-label='Đóng' or @aria-label='Close']"
+        ),
+    ]
+
+    for xpath in close_button_xpaths:
+        for button in driver.find_elements("xpath", xpath):
+            try:
+                if not button.is_displayed():
+                    continue
+                click_element(driver, button)
+                time.sleep(1)
+                close_popups(driver)
+                return
+            except Exception:  # pragma: no cover
+                continue
+
+
+def is_reply_editor(editor: Any) -> bool:
+    aria_label = clean_text(editor.get_attribute("aria-label") or "").lower()
+    aria_placeholder = clean_text(editor.get_attribute("aria-placeholder") or "").lower()
+    combined = f"{aria_label} {aria_placeholder}"
+    return "trả lời" in combined or "reply" in combined
+
+
+def looks_like_comment_editor(editor: Any) -> bool:
+    aria_label = clean_text(editor.get_attribute("aria-label") or "").lower()
+    aria_placeholder = clean_text(editor.get_attribute("aria-placeholder") or "").lower()
+    combined = f"{aria_label} {aria_placeholder}"
+    return "bình luận" in combined or "comment" in combined
+
+
+def find_comment_editor(driver: Any, *, timeout: float) -> Any:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        candidates: list[Any] = []
+        reply_candidates: list[Any] = []
+        for xpath in COMMENT_EDITOR_XPATHS:
+            for element in driver.find_elements("xpath", xpath):
+                try:
+                    if not element.is_displayed():
+                        continue
+                    if is_reply_editor(element):
+                        reply_candidates.append(element)
+                        continue
+                    candidates.append(element)
+                except Exception:  # pragma: no cover
+                    continue
+
+        for candidate in candidates:
+            try:
+                if looks_like_comment_editor(candidate):
+                    return candidate
+            except Exception:  # pragma: no cover
+                continue
+
+        if candidates:
+            return candidates[0]
+        if reply_candidates:
+            return reply_candidates[0]
+        time.sleep(0.4)
+
+    screenshot_path, html_path = dump_debug(driver, f"{DEBUG_OUTPUT_PREFIX}_comment_editor")
+    raise CommentBotError(
+        f"Could not find comment editor. Current URL: {driver.current_url}. "
+        f"Saved screenshot to {screenshot_path} and HTML to {html_path}."
+    )
+
+
+def fill_comment_editor(driver: Any, editor: Any, comment_text: str) -> None:
+    driver.execute_script(
+        """
+        const element = arguments[0];
+        const text = arguments[1];
+        element.focus();
+        if (document.activeElement !== element) {
+            element.click();
+        }
+        if (document.execCommand) {
+            try {
+                document.execCommand('selectAll', false, null);
+                if (document.execCommand('insertText', false, text)) {
+                    return;
+                }
+            } catch (error) {}
+        }
+        element.textContent = text;
+        element.dispatchEvent(new InputEvent('input', {
+            bubbles: true,
+            inputType: 'insertText',
+            data: text,
+        }));
+        element.dispatchEvent(new Event('change', {bubbles: true}));
+        """,
+        editor,
+        comment_text,
+    )
+
+
+def get_editor_text(editor: Any) -> str:
+    text = editor.get_attribute("textContent") or ""
+    if not text.strip():
+        text = editor.text or ""
+    return text
+
+
+def editor_contains_comment(editor: Any, comment_text: str) -> bool:
+    expected = clean_text(comment_text)
+    actual = clean_text(get_editor_text(editor))
+    if not expected:
+        return False
+    return expected == actual or expected in actual
+
+
+def submit_comment(editor: Any) -> None:
+    from selenium.webdriver.common.keys import Keys
+
+    editor.send_keys(Keys.ENTER)
+
+
+def comment_on_post(
+    post_url: str,
+    comment_text: str,
+    cookies: list[dict[str, str]],
+    *,
+    publish: bool,
+    headless: bool,
+    timeout: float,
+    page_load_wait: float,
+) -> str:
+    driver = build_driver(headless=headless)
+
+    try:
+        login_with_cookies(driver, cookies)
+        driver.get(post_url)
+        time.sleep(page_load_wait)
+        ensure_post_context(driver, post_url)
+
+        dismiss_blocking_dialogs(driver)
+        click_comment_trigger_if_available(driver, timeout=min(timeout, 5.0))
+        dismiss_blocking_dialogs(driver)
+        editor = find_comment_editor(driver, timeout=timeout)
+        fill_comment_editor(driver, editor, comment_text)
+        time.sleep(1)
+
+        dismiss_blocking_dialogs(driver)
+        editor = find_comment_editor(driver, timeout=min(timeout, 6.0))
+        if not editor_contains_comment(editor, comment_text):
+            screenshot_path, html_path = dump_debug(
+                driver,
+                f"{DEBUG_OUTPUT_PREFIX}_editor_text_mismatch",
+            )
+            raise CommentBotError(
+                "The comment editor was found, but the comment text was not inserted correctly. "
+                f"Saved screenshot to {screenshot_path} and HTML to {html_path}."
+            )
+
+        if not publish:
+            return "dry-run"
+
+        submit_comment(editor)
+        time.sleep(3)
+        return "published"
+    finally:
+        driver.quit()
+
+
+def main() -> None:
+    args = parse_args()
+    cookies = convert_raw_cookie(args.cookie_file)
+    if not cookies:
+        raise SystemExit(f"No valid cookies found in {args.cookie_file}")
+
+    comment_text = resolve_runtime_comment(args)
+    status = comment_on_post(
+        args.post_url,
+        comment_text,
+        cookies,
+        publish=args.publish,
+        headless=args.headless,
+        timeout=args.timeout,
+        page_load_wait=args.page_load_wait,
+    )
+    print(f"Comment status: {status}")
+    if status == "dry-run":
+        print("Editor was filled successfully. Re-run with --publish to submit the comment.")
+
 
 if __name__ == "__main__":
     main()

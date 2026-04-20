@@ -4,6 +4,8 @@ import argparse
 import time
 from pathlib import Path
 
+FACEBOOK_BASE_URL = "https://www.facebook.com/"
+
 
 def convert_raw_cookie(file_path: str | Path) -> list[dict[str, str]]:
     raw = Path(file_path).read_text(encoding="utf-8").strip()
@@ -23,6 +25,60 @@ def convert_raw_cookie(file_path: str | Path) -> list[dict[str, str]]:
         cookies.append({"name": name, "value": value})
 
     return cookies
+
+
+def normalize_cookie_for_facebook(cookie: dict[str, str]) -> dict[str, str]:
+    normalized = dict(cookie)
+    normalized["name"] = (normalized.get("name") or "").strip()
+    normalized["value"] = normalized.get("value") or ""
+    normalized.setdefault("domain", ".facebook.com")
+    normalized.setdefault("path", "/")
+    return normalized
+
+
+def has_active_facebook_session(driver) -> bool:
+    try:
+        c_user_cookie = driver.get_cookie("c_user")
+    except Exception:  # pragma: no cover
+        c_user_cookie = None
+
+    return bool(c_user_cookie and (c_user_cookie.get("value") or "").strip())
+
+
+def login_with_cookies(
+    driver,
+    cookies: list[dict[str, str]],
+    *,
+    base_url: str = FACEBOOK_BASE_URL,
+    initial_wait: float = 2.0,
+    post_login_wait: float = 3.0,
+) -> None:
+    driver.get(base_url)
+    time.sleep(initial_wait)
+
+    applied_cookie_names: list[str] = []
+    for cookie in cookies:
+        normalized_cookie = normalize_cookie_for_facebook(cookie)
+        if not normalized_cookie["name"]:
+            continue
+
+        try:
+            driver.add_cookie(normalized_cookie)
+            applied_cookie_names.append(normalized_cookie["name"])
+        except Exception as exc:  # pragma: no cover
+            print(f"Skipped cookie {normalized_cookie['name']}: {exc}")
+
+    driver.get(base_url)
+    time.sleep(post_login_wait)
+
+    if not applied_cookie_names:
+        raise RuntimeError("Could not add any Facebook cookies to the browser session.")
+
+    if not has_active_facebook_session(driver):
+        raise RuntimeError(
+            "Facebook login via cookie did not become active. "
+            "Refresh fb_cookie.txt with a valid logged-in cookie string."
+        )
 
 
 def build_driver(headless: bool = False):
@@ -68,17 +124,7 @@ def send_friend_request(
     driver = build_driver(headless=headless)
 
     try:
-        driver.get("https://www.facebook.com/")
-        time.sleep(2)
-
-        for cookie in cookies:
-            try:
-                driver.add_cookie(cookie)
-            except Exception as exc:  # pragma: no cover
-                print(f"Skipped cookie {cookie['name']}: {exc}")
-
-        driver.get("https://www.facebook.com/")
-        time.sleep(3)
+        login_with_cookies(driver, cookies)
 
         profile_url = build_profile_url(uid)
         driver.get(profile_url)
