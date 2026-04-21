@@ -179,6 +179,7 @@ def expand_post_see_more(driver) -> None:
 
 
 def find_post_container(driver, message_node):
+    print("[find_post_container] Executing JavaScript to find post container...")
     script = """
     const start = arguments[0];
     const hasPostLink = (el) => Boolean(
@@ -193,34 +194,51 @@ def find_post_container(driver, message_node):
     );
 
     let el = start;
+    let depth = 0;
     while (el && el.nodeType === 1) {
       if (hasPostLink(el) && hasActionBar(el)) {
+        console.log('[JS] Found container with both post link and action bar at depth ' + depth);
         return el;
       }
       el = el.parentElement;
+      depth++;
     }
 
     el = start;
+    depth = 0;
     while (el && el.nodeType === 1) {
       if (hasPostLink(el)) {
+        console.log('[JS] Found container with post link at depth ' + depth);
         return el;
       }
       el = el.parentElement;
+      depth++;
     }
 
+    console.log('[JS] No container found, returning start element');
     return start;
     """
-    return driver.execute_script(script, message_node)
+    result = driver.execute_script(script, message_node)
+    print(f"[find_post_container] ✓ Container found: {result.tag_name if result else 'None'}")
+    return result
 
 
 def find_post_context_from_message(driver, message_node):
+    print("[find_post_context] Starting find_post_context_from_message...")
     try:
+        print(f"[find_post_context] Trying POST_CONTEXT_XPATH: {POST_CONTEXT_XPATH}")
         context = message_node.find_element("xpath", POST_CONTEXT_XPATH)
         if context:
+            print("[find_post_context] ✓ Found context via XPath")
             return context
-    except Exception:
-        pass
-    return find_post_container(driver, message_node)
+        print("[find_post_context] XPath returned None")
+    except Exception as e:
+        print(f"[find_post_context] XPath failed: {type(e).__name__}: {e}")
+
+    print("[find_post_context] Fallback: Using find_post_container (JavaScript)...")
+    result = find_post_container(driver, message_node)
+    print(f"[find_post_context] find_post_container returned: {result}")
+    return result
 
 
 def extract_message_text(message_node) -> str:
@@ -235,21 +253,36 @@ def extract_message_text(message_node) -> str:
 
 
 def extract_post_url(container) -> str:
+    print("[extract_post_url] Starting extract_post_url...")
+
+    # Step 1: Try extract_post_url_from_context
     url = extract_post_url_from_context(container)
+    print(f"[extract_post_url] extract_post_url_from_context returned: {url}")
     if url and "comment_id=" not in url:
+        print(f"[extract_post_url] ✓ Using URL from context: {url}")
         return url
 
+    # Step 2: Fallback to XPath search
+    print("[extract_post_url] Fallback: Searching via XPath for post links...")
     xpath = (
         ".//a[contains(@href,'/posts/')"
         " or contains(@href,'/permalink/')"
         " or contains(@href,'story_fbid=')]"
     )
-    for link in container.find_elements("xpath", xpath):
-        href = (link.get_attribute("href") or "").strip()
-        if not href or "comment_id=" in href:
-            continue
-        return href.split("?")[0]
+    links = container.find_elements("xpath", xpath)
+    print(f"[extract_post_url] Found {len(links)} potential post links")
 
+    for index, link in enumerate(links, start=1):
+        href = (link.get_attribute("href") or "").strip()
+        print(f"[extract_post_url] Link #{index}: {href}")
+        if not href or "comment_id=" in href:
+            print(f"[extract_post_url]   - Skipping (empty or has comment_id)")
+            continue
+        clean_url = href.split("?")[0]
+        print(f"[extract_post_url] ✓ Found valid URL (cleaned): {clean_url}")
+        return clean_url
+
+    print("[extract_post_url] ✗ No post URL found")
     return ""
 
 
@@ -405,16 +438,29 @@ def extract_post_body(article, author: str) -> str:
 
 
 def extract_post_record_from_message_node(driver, message_node, group_url: str) -> dict[str, str] | None:
+    print("[extract_post_record] ========== Processing message node ==========")
     container = find_post_context_from_message(driver, message_node)
+    print(f"[extract_post_record] Got container: {container.tag_name if container else 'None'}")
+
     author = extract_author(container)
+    print(f"[extract_post_record] Author: '{author}'")
+
     post_url = extract_post_url(container)
+    print(f"[extract_post_record] Post URL: '{post_url}'")
+
     content = extract_message_text(message_node)
+    print(f"[extract_post_record] Message text length: {len(content) if content else 0}")
     if not content:
         content = extract_post_body(container, author)
+        print(f"[extract_post_record] Extracted from post body, length: {len(content) if content else 0}")
 
     if not content:
+        print("[extract_post_record] ✗ No content found, returning None")
+        print("[extract_post_record] =========================================")
         return None
 
+    print(f"[extract_post_record] ✓ Record complete: author='{author}', url='{post_url}', content_len={len(content)}")
+    print("[extract_post_record] =========================================")
     return {
         "post_key": build_post_key(post_url, author, content),
         "author": author,
