@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -95,6 +97,18 @@ class EditorMatchTests(unittest.TestCase):
         editor = _FakeEditor("Noi dung khac")
         self.assertFalse(main_ai_bot_comment.editor_contains_comment(editor, "Xin chao"))
 
+    def test_matches_when_facebook_text_content_drops_newline_spacing(self) -> None:
+        editor = _FakeEditor(
+            "Chúc bạn thi thật tốt nhéĐừng căng quá, cứ làm quen format là ok rồiThi xong nhớ lên update kết quả nha"
+        )
+
+        self.assertTrue(
+            main_ai_bot_comment.editor_contains_comment(
+                editor,
+                "Chúc bạn thi thật tốt nhé\nĐừng căng quá, cứ làm quen format là ok rồi\nThi xong nhớ lên update kết quả nha",
+            )
+        )
+
 
 class FindCommentEditorTests(unittest.TestCase):
     class _FakeDriver:
@@ -120,6 +134,28 @@ class FindCommentEditorTests(unittest.TestCase):
         editor = main_ai_bot_comment.find_comment_editor(driver, timeout=0.1)
 
         self.assertIsNotNone(editor)
+
+    @patch.object(main_ai_bot_comment.time, "sleep", return_value=None)
+    def test_debug_scan_prints_candidate_details(self, _sleep) -> None:
+        driver = self._FakeDriver(
+            [
+                _FakeEditor(
+                    aria_label="Viết câu trả lời...",
+                    aria_placeholder="Viết câu trả lời...",
+                )
+            ]
+        )
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            main_ai_bot_comment.find_comment_editor(
+                driver,
+                timeout=0.1,
+                debug_scan=True,
+            )
+
+        self.assertIn("[find_comment_editor] scan #1 start", output.getvalue())
+        self.assertIn("selected reply fallback candidate", output.getvalue())
 
 
 class MainTests(unittest.TestCase):

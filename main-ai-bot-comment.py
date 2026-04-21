@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from main import build_driver, convert_raw_cookie
-from scrape_features.group_posts.scraper import clean_text, close_popups, dump_debug, login_with_cookies
+from scrape_features.group_posts.scraper import clean_text, dump_debug, login_with_cookies
 
 
 DEBUG_OUTPUT_PREFIX = "scrape_features/comment_replies/debug/manual_comment"
@@ -105,6 +105,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=5.0,
         help="Seconds to wait after opening the post page.",
+    )
+    parser.add_argument(
+        "--debug-editor-scan",
+        action="store_true",
+        help="Print each find_comment_editor scan step, including matched elements and aria labels.",
     )
     parser.add_argument(
         "--ai-model",
@@ -246,27 +251,27 @@ def click_comment_trigger_if_available(driver: Any, *, timeout: float) -> None:
 
 
 def dismiss_blocking_dialogs(driver: Any) -> None:
-    close_popups(driver)
-
-    close_button_xpaths = [
+    safe_dismiss_xpaths = [
         (
-            "//*[@role='dialog']//*[@role='button' and ("
-            "@aria-label='Đóng' or @aria-label='Close'"
+            "//*[@role='button' and ("
+            "@aria-label='Not Now' or @aria-label='Lúc khác'"
+            " or @aria-label='Bỏ qua' or @aria-label='Skip'"
             ")]"
         ),
         (
-            "//*[@role='dialog']//*[@aria-label='Đóng' or @aria-label='Close']"
+            "//span[normalize-space()='Not Now' or normalize-space()='Lúc khác'"
+            " or normalize-space()='Bỏ qua' or normalize-space()='Skip']"
+            "/ancestor::*[@role='button'][1]"
         ),
     ]
 
-    for xpath in close_button_xpaths:
+    for xpath in safe_dismiss_xpaths:
         for button in driver.find_elements("xpath", xpath):
             try:
                 if not button.is_displayed():
                     continue
                 click_element(driver, button)
                 time.sleep(1)
-                close_popups(driver)
                 return
             except Exception:  # pragma: no cover
                 continue
@@ -286,34 +291,110 @@ def looks_like_comment_editor(editor: Any) -> bool:
     return "bình luận" in combined or "comment" in combined
 
 
-def find_comment_editor(driver: Any, *, timeout: float) -> Any:
+def truncate_debug_value(value: str, *, limit: int = 100) -> str:
+    normalized = clean_text(value)
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit - 3]}..."
+
+
+def describe_editor_candidate(element: Any) -> str:
+    try:
+        aria_label = element.get_attribute("aria-label") or ""
+    except Exception:
+        aria_label = ""
+    try:
+        aria_placeholder = element.get_attribute("aria-placeholder") or ""
+    except Exception:
+        aria_placeholder = ""
+    try:
+        text = get_editor_text(element)
+    except Exception:
+        text = ""
+
+    return (
+        f"label='{truncate_debug_value(aria_label)}' "
+        f"placeholder='{truncate_debug_value(aria_placeholder)}' "
+        f"text='{truncate_debug_value(text)}'"
+    )
+
+
+def debug_editor_scan(message: str, *, enabled: bool) -> None:
+    if enabled:
+        print(f"[find_comment_editor] {message}")
+
+
+def find_comment_editor(driver: Any, *, timeout: float, debug_scan: bool = False) -> Any:
     deadline = time.time() + timeout
+    scan_count = 0
     while time.time() < deadline:
+        scan_count += 1
+        debug_editor_scan(
+            f"scan #{scan_count} start; current_url={getattr(driver, 'current_url', '<unknown>')}",
+            enabled=debug_scan,
+        )
         candidates: list[Any] = []
         reply_candidates: list[Any] = []
-        for xpath in COMMENT_EDITOR_XPATHS:
-            for element in driver.find_elements("xpath", xpath):
+        for xpath_index, xpath in enumerate(COMMENT_EDITOR_XPATHS, start=1):
+            elements = driver.find_elements("xpath", xpath)
+            debug_editor_scan(
+                f"xpath #{xpath_index} matched {len(elements)} elements: {xpath}",
+                enabled=debug_scan,
+            )
+            for element_index, element in enumerate(elements, start=1):
                 try:
-                    if not element.is_displayed():
+                    displayed = element.is_displayed()
+                    reply_editor = is_reply_editor(element)
+                    comment_editor = looks_like_comment_editor(element)
+                    debug_editor_scan(
+                        (
+                            f"element #{element_index}: displayed={displayed} "
+                            f"reply={reply_editor} comment_like={comment_editor} "
+                            f"{describe_editor_candidate(element)}"
+                        ),
+                        enabled=debug_scan,
+                    )
+                    if not displayed:
                         continue
-                    if is_reply_editor(element):
+                    if reply_editor:
                         reply_candidates.append(element)
                         continue
                     candidates.append(element)
-                except Exception:  # pragma: no cover
+                except Exception as exc:  # pragma: no cover
+                    debug_editor_scan(
+                        f"element #{element_index}: skipped due to {type(exc).__name__}: {exc}",
+                        enabled=debug_scan,
+                    )
                     continue
 
         for candidate in candidates:
             try:
                 if looks_like_comment_editor(candidate):
+                    debug_editor_scan(
+                        f"selected comment-like editor: {describe_editor_candidate(candidate)}",
+                        enabled=debug_scan,
+                    )
                     return candidate
-            except Exception:  # pragma: no cover
+            except Exception as exc:  # pragma: no cover
+                debug_editor_scan(
+                    f"comment-like check failed with {type(exc).__name__}: {exc}",
+                    enabled=debug_scan,
+                )
                 continue
 
         if candidates:
+            debug_editor_scan(
+                f"selected first visible non-reply candidate: {describe_editor_candidate(candidates[0])}",
+                enabled=debug_scan,
+            )
             return candidates[0]
         if reply_candidates:
+            debug_editor_scan(
+                f"selected reply fallback candidate: {describe_editor_candidate(reply_candidates[0])}",
+                enabled=debug_scan,
+            )
             return reply_candidates[0]
+        debug_editor_scan("no visible editor candidates found; sleeping 0.4s", enabled=debug_scan)
         time.sleep(0.4)
 
     screenshot_path, html_path = dump_debug(driver, f"{DEBUG_OUTPUT_PREFIX}_comment_editor")
@@ -353,6 +434,30 @@ def fill_comment_editor(driver: Any, editor: Any, comment_text: str) -> None:
     )
 
 
+def fill_comment_editor_with_keys(driver: Any, editor: Any, comment_text: str) -> None:
+    from selenium.webdriver import ActionChains
+    from selenium.webdriver.common.keys import Keys
+
+    click_element(driver, editor)
+    ActionChains(driver).click(editor).perform()
+
+    for modifier in (Keys.COMMAND, Keys.CONTROL):
+        try:
+            ActionChains(driver).key_down(modifier).send_keys("a").key_up(modifier).perform()
+            break
+        except Exception:
+            continue
+
+    editor.send_keys(Keys.BACKSPACE)
+
+    lines = comment_text.split("\n")
+    for index, line in enumerate(lines):
+        if line:
+            editor.send_keys(line)
+        if index != len(lines) - 1:
+            ActionChains(driver).key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).perform()
+
+
 def get_editor_text(editor: Any) -> str:
     text = editor.get_attribute("textContent") or ""
     if not text.strip():
@@ -360,12 +465,20 @@ def get_editor_text(editor: Any) -> str:
     return text
 
 
+def compact_text(value: str) -> str:
+    return "".join(value.split())
+
+
 def editor_contains_comment(editor: Any, comment_text: str) -> bool:
     expected = clean_text(comment_text)
     actual = clean_text(get_editor_text(editor))
     if not expected:
         return False
-    return expected == actual or expected in actual
+    if expected == actual or expected in actual:
+        return True
+    compact_expected = compact_text(comment_text)
+    compact_actual = compact_text(get_editor_text(editor))
+    return bool(compact_expected and (compact_expected == compact_actual or compact_expected in compact_actual))
 
 
 def submit_comment(editor: Any) -> None:
@@ -383,6 +496,7 @@ def comment_on_post(
     headless: bool,
     timeout: float,
     page_load_wait: float,
+    debug_editor_scan: bool,
 ) -> str:
     driver = build_driver(headless=headless)
 
@@ -393,14 +507,31 @@ def comment_on_post(
         ensure_post_context(driver, post_url)
 
         dismiss_blocking_dialogs(driver)
+        ensure_post_context(driver, post_url)
         click_comment_trigger_if_available(driver, timeout=min(timeout, 5.0))
         dismiss_blocking_dialogs(driver)
-        editor = find_comment_editor(driver, timeout=timeout)
+        ensure_post_context(driver, post_url)
+        editor = find_comment_editor(driver, timeout=timeout, debug_scan=debug_editor_scan)
         fill_comment_editor(driver, editor, comment_text)
         time.sleep(1)
 
         dismiss_blocking_dialogs(driver)
-        editor = find_comment_editor(driver, timeout=min(timeout, 6.0))
+        ensure_post_context(driver, post_url)
+        editor = find_comment_editor(
+            driver,
+            timeout=min(timeout, 6.0),
+            debug_scan=debug_editor_scan,
+        )
+        if not editor_contains_comment(editor, comment_text):
+            debug_editor_scan("JS insert mismatch; retrying with keyboard input", enabled=debug_editor_scan)
+            fill_comment_editor_with_keys(driver, editor, comment_text)
+            time.sleep(1)
+            editor = find_comment_editor(
+                driver,
+                timeout=min(timeout, 6.0),
+                debug_scan=debug_editor_scan,
+            )
+
         if not editor_contains_comment(editor, comment_text):
             screenshot_path, html_path = dump_debug(
                 driver,
@@ -436,6 +567,7 @@ def main() -> None:
         headless=args.headless,
         timeout=args.timeout,
         page_load_wait=args.page_load_wait,
+        debug_editor_scan=args.debug_editor_scan,
     )
     print(f"Comment status: {status}")
     if status == "dry-run":
