@@ -481,10 +481,30 @@ def editor_contains_comment(editor: Any, comment_text: str) -> bool:
     return bool(compact_expected and (compact_expected == compact_actual or compact_expected in compact_actual))
 
 
-def submit_comment(editor: Any) -> None:
+def submit_comment(editor: Any, driver: Any = None) -> None:
     from selenium.webdriver.common.keys import Keys
 
-    editor.send_keys(Keys.ENTER)
+    print("[submit_comment] Starting submit...")
+
+    try:
+        if driver:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", editor
+            )
+            print("[submit_comment] Scrolled editor into view")
+
+        # Try to focus element first
+        editor.click()
+        print("[submit_comment] Editor clicked")
+        time.sleep(0.2)
+
+        # Send ENTER key
+        editor.send_keys(Keys.ENTER)
+        print("[submit_comment] ENTER key sent successfully")
+
+    except Exception as e:
+        print(f"[submit_comment] ERROR during submit: {type(e).__name__}: {e}")
+        raise
 
 
 def comment_on_post(
@@ -545,10 +565,19 @@ def comment_on_post(
         if not publish:
             return "dry-run"
 
-        submit_comment(editor)
+        print("[comment_on_post] ========== PUBLISHING COMMENT ==========")
+        print(f"[comment_on_post] Editor details: tag={editor.tag_name}, id={editor.get_attribute('id')}, class={editor.get_attribute('class')}")
+        print(f"[comment_on_post] Text in editor: {clean_text(get_editor_text(editor))[:100]}...")
+        print("[comment_on_post] Calling submit_comment()...")
+        submit_comment(editor, driver)
+        print("[comment_on_post] ✓ submit_comment() returned successfully")
+        print("[comment_on_post] Waiting 3s for submission to complete...")
         time.sleep(3)
+        print("[comment_on_post] ✓ Published successfully")
+        print("[comment_on_post] =====================================")
         return "published"
     finally:
+        print("[comment_on_post] Closing driver...")
         driver.quit()
 
 
