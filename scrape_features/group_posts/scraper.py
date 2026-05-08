@@ -237,8 +237,22 @@ def dump_debug(driver, prefix: str) -> tuple[Path, Path]:
     html_path = Path(f"{prefix}.html").resolve()
     screenshot_path.parent.mkdir(parents=True, exist_ok=True)
     html_path.parent.mkdir(parents=True, exist_ok=True)
-    driver.save_screenshot(str(screenshot_path))
-    html_path.write_text(driver.page_source, encoding="utf-8")
+    screenshot_error = None
+    try:
+        driver.save_screenshot(str(screenshot_path))
+    except Exception as exc:  # pragma: no cover
+        screenshot_error = f"{type(exc).__name__}: {exc}"
+
+    page_source = ""
+    try:
+        page_source = driver.page_source
+    except Exception as exc:  # pragma: no cover
+        page_source = f"Could not read page_source: {type(exc).__name__}: {exc}\n"
+
+    if screenshot_error:
+        page_source = f"Screenshot failed: {screenshot_error}\n\n{page_source}"
+
+    html_path.write_text(page_source, encoding="utf-8")
     return screenshot_path, html_path
 
 

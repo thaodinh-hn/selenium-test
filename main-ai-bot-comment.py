@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from main import build_driver, convert_raw_cookie
+from main import bring_chrome_to_front, build_driver, convert_raw_cookie, has_active_facebook_session
 from scrape_features.group_posts.scraper import clean_text, dump_debug, login_with_cookies
 
 
@@ -33,6 +33,13 @@ COMMENT_EDITOR_XPATHS = [
 COMMENT_TRIGGER_XPATHS = [
     (
         "//*[@role='button' and ("
+        "@aria-label='Viết bình luận'"
+        " or @aria-label='Write a comment'"
+        " or @aria-label='Write a public comment'"
+        ")]"
+    ),
+    (
+        "//*[@role='button' and ("
         "contains(@aria-label, 'Bình luận')"
         " or contains(@aria-label, 'Comment')"
         ")]"
@@ -45,6 +52,7 @@ COMMENT_TRIGGER_XPATHS = [
 ]
 
 POST_URL_HINT_PATTERN = re.compile(r"/posts/|story_fbid=|/permalink/")
+POST_IDENTIFIER_PATTERN = re.compile(r"/posts/(\d+)|story_fbid=(\d+)|/permalink/(\d+)")
 AI_SUFFIX = "Do not include emojis or any introductory phrases or additional text."
 
 
@@ -93,6 +101,14 @@ def parse_args() -> argparse.Namespace:
         "--headless",
         action="store_true",
         help="Run Chrome in headless mode.",
+    )
+    parser.add_argument(
+        "--chrome-user-data-dir",
+        help="Path to a Chrome user data directory to reuse an existing signed-in profile.",
+    )
+    parser.add_argument(
+        "--chrome-debugger-address",
+        help="Debugger address for an already-open Chrome instance, for example 127.0.0.1:9222.",
     )
     parser.add_argument(
         "--timeout",
@@ -201,7 +217,22 @@ def wait_for_element(driver: Any, xpaths: list[str], *, timeout: float, label: s
     )
 
 
-def click_element(driver: Any, element: Any) -> None:
+def click_element(driver: Any, element: Any, *, visible_mode: bool = False) -> None:
+    if visible_mode:
+        try:
+            from selenium.webdriver import ActionChains
+
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
+                element,
+            )
+            time.sleep(0.3)
+            ActionChains(driver).move_to_element(element).pause(0.2).click().perform()
+            time.sleep(0.2)
+            return
+        except Exception:
+            pass
+
     driver.execute_script(
         "arguments[0].scrollIntoView({block: 'center', inline: 'nearest'});",
         element,
@@ -221,6 +252,16 @@ def looks_like_post_url(url: str) -> bool:
     return bool(POST_URL_HINT_PATTERN.search(url))
 
 
+def extract_post_identifier(url: str) -> str:
+    match = POST_IDENTIFIER_PATTERN.search(url)
+    if not match:
+        return ""
+    for value in match.groups():
+        if value:
+            return value
+    return ""
+
+
 def ensure_post_context(driver: Any, expected_post_url: str) -> None:
     current_url = clean_text(driver.current_url)
     if not current_url:
@@ -233,9 +274,41 @@ def ensure_post_context(driver: Any, expected_post_url: str) -> None:
         raise CommentBotError(
             f"Expected post URL but browser was redirected to: {current_url}"
         )
+    expected_post_id = extract_post_identifier(expected_post_url)
+    current_post_id = extract_post_identifier(current_url)
+    if expected_post_id and current_post_id and expected_post_id != current_post_id:
+        raise CommentBotError(
+            "Facebook redirected to a different post than the one requested. "
+            f"Expected post ID {expected_post_id} from {expected_post_url}, "
+            f"but browser is on post ID {current_post_id}: {current_url}"
+        )
 
 
-def click_comment_trigger_if_available(driver: Any, *, timeout: float) -> None:
+def prepare_visible_browser_context(driver: Any) -> None:
+    try:
+        existing_handles = driver.window_handles
+        driver.switch_to.new_window("tab")
+        time.sleep(0.5)
+        bring_chrome_to_front()
+        driver.execute_script("window.focus();")
+        print(
+            "[comment_on_post] Opened a fresh visible tab "
+            f"(handles before={len(existing_handles)}, after={len(driver.window_handles)})."
+        )
+    except Exception as exc:  # pragma: no cover
+        print(
+            "[comment_on_post] Could not open a fresh visible tab; "
+            f"continuing with current tab: {type(exc).__name__}: {exc}"
+        )
+        try:
+            handles = driver.window_handles
+            if handles:
+                driver.switch_to.window(handles[-1])
+        except Exception:
+            pass
+
+
+def click_comment_trigger_if_available(driver: Any, *, timeout: float, visible_mode: bool = False) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         for xpath in COMMENT_TRIGGER_XPATHS:
@@ -243,14 +316,18 @@ def click_comment_trigger_if_available(driver: Any, *, timeout: float) -> None:
                 try:
                     if not button.is_displayed():
                         continue
-                    click_element(driver, button)
+                    aria_label = clean_text(button.get_attribute("aria-label") or "")
+                    if aria_label:
+                        print(f"[click_comment_trigger] Clicking trigger: {aria_label}")
+                    click_element(driver, button, visible_mode=visible_mode)
+                    time.sleep(1)
                     return
                 except Exception:  # pragma: no cover
                     continue
         time.sleep(0.3)
 
 
-def dismiss_blocking_dialogs(driver: Any) -> None:
+def dismiss_blocking_dialogs(driver: Any, *, visible_mode: bool = False) -> None:
     safe_dismiss_xpaths = [
         (
             "//*[@role='button' and ("
@@ -270,7 +347,7 @@ def dismiss_blocking_dialogs(driver: Any) -> None:
             try:
                 if not button.is_displayed():
                     continue
-                click_element(driver, button)
+                click_element(driver, button, visible_mode=visible_mode)
                 time.sleep(1)
                 return
             except Exception:  # pragma: no cover
@@ -324,9 +401,80 @@ def debug_editor_scan(message: str, *, enabled: bool) -> None:
         print(f"[find_comment_editor] {message}")
 
 
-def find_comment_editor(driver: Any, *, timeout: float, debug_scan: bool = False) -> Any:
+def try_activate_hidden_editor(
+    driver: Any,
+    editor: Any,
+    *,
+    debug_scan: bool = False,
+    visible_mode: bool = False,
+) -> bool:
+    if visible_mode:
+        try:
+            click_element(driver, editor, visible_mode=True)
+            time.sleep(0.5)
+            return bool(editor.is_displayed())
+        except Exception as exc:  # pragma: no cover
+            debug_editor_scan(
+                f"visible hidden editor activation failed with {type(exc).__name__}: {exc}",
+                enabled=debug_scan,
+            )
+
+    try:
+        activated = driver.execute_script(
+            """
+            const editor = arguments[0];
+            const clickTarget =
+              editor.closest('form')
+              || editor.parentElement
+              || editor;
+
+            editor.scrollIntoView({block: 'center', inline: 'nearest'});
+
+            const placeholder =
+              (editor.parentElement && editor.parentElement.querySelector('[aria-hidden="true"]'))
+              || (clickTarget && clickTarget.querySelector('[aria-hidden="true"]'));
+
+            const targets = [placeholder, clickTarget, editor].filter(Boolean);
+            for (const target of targets) {
+              try {
+                target.dispatchEvent(new MouseEvent('mousedown', {bubbles: true}));
+                target.dispatchEvent(new MouseEvent('mouseup', {bubbles: true}));
+                target.click();
+              } catch (error) {}
+            }
+
+            try {
+              editor.focus();
+            } catch (error) {}
+
+            return document.activeElement === editor || editor.getAttribute('contenteditable') === 'true';
+            """,
+            editor,
+        )
+    except Exception as exc:  # pragma: no cover
+        debug_editor_scan(
+            f"hidden editor activation failed with {type(exc).__name__}: {exc}",
+            enabled=debug_scan,
+        )
+        return False
+
+    debug_editor_scan(
+        f"hidden editor activation attempted; activated={activated}",
+        enabled=debug_scan,
+    )
+    return bool(activated)
+
+
+def find_comment_editor(
+    driver: Any,
+    *,
+    timeout: float,
+    debug_scan: bool = False,
+    visible_mode: bool = False,
+) -> Any:
     deadline = time.time() + timeout
     scan_count = 0
+    attempted_hidden_activation = False
     while time.time() < deadline:
         scan_count += 1
         debug_editor_scan(
@@ -335,6 +483,7 @@ def find_comment_editor(driver: Any, *, timeout: float, debug_scan: bool = False
         )
         candidates: list[Any] = []
         reply_candidates: list[Any] = []
+        hidden_comment_candidates: list[Any] = []
         for xpath_index, xpath in enumerate(COMMENT_EDITOR_XPATHS, start=1):
             elements = driver.find_elements("xpath", xpath)
             debug_editor_scan(
@@ -355,6 +504,8 @@ def find_comment_editor(driver: Any, *, timeout: float, debug_scan: bool = False
                         enabled=debug_scan,
                     )
                     if not displayed:
+                        if comment_editor and not reply_editor:
+                            hidden_comment_candidates.append(element)
                         continue
                     if reply_editor:
                         reply_candidates.append(element)
@@ -394,6 +545,20 @@ def find_comment_editor(driver: Any, *, timeout: float, debug_scan: bool = False
                 enabled=debug_scan,
             )
             return reply_candidates[0]
+        if hidden_comment_candidates and not attempted_hidden_activation:
+            attempted_hidden_activation = True
+            debug_editor_scan(
+                f"attempting to activate hidden comment editor: {describe_editor_candidate(hidden_comment_candidates[0])}",
+                enabled=debug_scan,
+            )
+            if try_activate_hidden_editor(
+                driver,
+                hidden_comment_candidates[0],
+                debug_scan=debug_scan,
+                visible_mode=visible_mode,
+            ):
+                time.sleep(1)
+                continue
         debug_editor_scan("no visible editor candidates found; sleeping 0.4s", enabled=debug_scan)
         time.sleep(0.4)
 
@@ -438,8 +603,9 @@ def fill_comment_editor_with_keys(driver: Any, editor: Any, comment_text: str) -
     from selenium.webdriver import ActionChains
     from selenium.webdriver.common.keys import Keys
 
-    click_element(driver, editor)
-    ActionChains(driver).click(editor).perform()
+    click_element(driver, editor, visible_mode=True)
+    ActionChains(driver).move_to_element(editor).pause(0.2).click().perform()
+    time.sleep(0.2)
 
     for modifier in (Keys.COMMAND, Keys.CONTROL):
         try:
@@ -449,13 +615,16 @@ def fill_comment_editor_with_keys(driver: Any, editor: Any, comment_text: str) -
             continue
 
     editor.send_keys(Keys.BACKSPACE)
+    time.sleep(0.2)
 
     lines = comment_text.split("\n")
     for index, line in enumerate(lines):
-        if line:
-            editor.send_keys(line)
+        for character in line:
+            editor.send_keys(character)
+            time.sleep(0.03)
         if index != len(lines) - 1:
             ActionChains(driver).key_down(Keys.SHIFT).send_keys(Keys.ENTER).key_up(Keys.SHIFT).perform()
+            time.sleep(0.1)
 
 
 def get_editor_text(editor: Any) -> str:
@@ -482,6 +651,7 @@ def editor_contains_comment(editor: Any, comment_text: str) -> bool:
 
 
 def submit_comment(editor: Any, driver: Any = None) -> None:
+    from selenium.webdriver import ActionChains
     from selenium.webdriver.common.keys import Keys
 
     print("[submit_comment] Starting submit...")
@@ -494,7 +664,8 @@ def submit_comment(editor: Any, driver: Any = None) -> None:
             print("[submit_comment] Scrolled editor into view")
 
         # Try to focus element first
-        editor.click()
+        click_element(driver, editor, visible_mode=True)
+        ActionChains(driver).move_to_element(editor).pause(0.2).click().perform()
         print("[submit_comment] Editor clicked")
         time.sleep(0.2)
 
@@ -514,33 +685,69 @@ def comment_on_post(
     *,
     publish: bool,
     headless: bool,
+    chrome_user_data_dir: str | None,
+    chrome_debugger_address: str | None,
     timeout: float,
     page_load_wait: float,
     debug_editor_scan: bool,
 ) -> str:
-    driver = build_driver(headless=headless)
+    visible_mode = not headless
+    driver = build_driver(
+        headless=headless,
+        chrome_user_data_dir=chrome_user_data_dir,
+        chrome_debugger_address=chrome_debugger_address,
+    )
 
     try:
-        login_with_cookies(driver, cookies)
+        if not headless:
+            bring_chrome_to_front()
+            if chrome_debugger_address:
+                prepare_visible_browser_context(driver)
+        driver.get("https://www.facebook.com/")
+        time.sleep(2)
+        if has_active_facebook_session(driver):
+            print("[comment_on_post] Using active Facebook session from Chrome profile.")
+        elif cookies:
+            login_with_cookies(driver, cookies)
+        else:
+            raise CommentBotError(
+                "No active Facebook session was found in the Chrome profile, "
+                "and no valid cookies were loaded from the cookie file."
+            )
         driver.get(post_url)
+        if not headless:
+            bring_chrome_to_front()
         time.sleep(page_load_wait)
         ensure_post_context(driver, post_url)
 
-        dismiss_blocking_dialogs(driver)
+        dismiss_blocking_dialogs(driver, visible_mode=visible_mode)
         ensure_post_context(driver, post_url)
-        click_comment_trigger_if_available(driver, timeout=min(timeout, 5.0))
-        dismiss_blocking_dialogs(driver)
+        click_comment_trigger_if_available(
+            driver,
+            timeout=min(timeout, 5.0),
+            visible_mode=visible_mode,
+        )
+        dismiss_blocking_dialogs(driver, visible_mode=visible_mode)
         ensure_post_context(driver, post_url)
-        editor = find_comment_editor(driver, timeout=timeout, debug_scan=debug_editor_scan)
-        fill_comment_editor(driver, editor, comment_text)
-        time.sleep(1)
+        editor = find_comment_editor(
+            driver,
+            timeout=timeout,
+            debug_scan=debug_editor_scan,
+            visible_mode=visible_mode,
+        )
+        if visible_mode:
+            fill_comment_editor_with_keys(driver, editor, comment_text)
+        else:
+            fill_comment_editor(driver, editor, comment_text)
+        time.sleep(1.5)
 
-        dismiss_blocking_dialogs(driver)
+        dismiss_blocking_dialogs(driver, visible_mode=visible_mode)
         ensure_post_context(driver, post_url)
         editor = find_comment_editor(
             driver,
             timeout=min(timeout, 6.0),
             debug_scan=debug_editor_scan,
+            visible_mode=visible_mode,
         )
         if not editor_contains_comment(editor, comment_text):
             debug_editor_scan("JS insert mismatch; retrying with keyboard input", enabled=debug_editor_scan)
@@ -550,6 +757,7 @@ def comment_on_post(
                 driver,
                 timeout=min(timeout, 6.0),
                 debug_scan=debug_editor_scan,
+                visible_mode=visible_mode,
             )
 
         if not editor_contains_comment(editor, comment_text):
@@ -583,9 +791,8 @@ def comment_on_post(
 
 def main() -> None:
     args = parse_args()
-    cookies = convert_raw_cookie(args.cookie_file)
-    if not cookies:
-        raise SystemExit(f"No valid cookies found in {args.cookie_file}")
+    cookie_path = Path(args.cookie_file)
+    cookies = convert_raw_cookie(cookie_path) if cookie_path.exists() else []
 
     comment_text = resolve_runtime_comment(args)
     status = comment_on_post(
@@ -594,6 +801,8 @@ def main() -> None:
         cookies,
         publish=args.publish,
         headless=args.headless,
+        chrome_user_data_dir=args.chrome_user_data_dir,
+        chrome_debugger_address=args.chrome_debugger_address,
         timeout=args.timeout,
         page_load_wait=args.page_load_wait,
         debug_editor_scan=args.debug_editor_scan,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
 import time
 from pathlib import Path
 
@@ -81,7 +82,11 @@ def login_with_cookies(
         )
 
 
-def build_driver(headless: bool = False):
+def build_driver(
+    headless: bool = False,
+    chrome_user_data_dir: str | None = None,
+    chrome_debugger_address: str | None = None,
+):
     try:
         from selenium import webdriver
     except ModuleNotFoundError as exc:
@@ -92,10 +97,29 @@ def build_driver(headless: bool = False):
     options = webdriver.ChromeOptions()
     options.add_argument("--disable-notifications")
     options.add_argument("--start-maximized")
+    if chrome_debugger_address:
+        options.debugger_address = chrome_debugger_address
+    if chrome_user_data_dir:
+        profile_path = Path(chrome_user_data_dir).expanduser().resolve()
+        options.add_argument(f"--user-data-dir={profile_path}")
     if headless:
         options.add_argument("--headless=new")
 
     return webdriver.Chrome(options=options)
+
+
+def bring_chrome_to_front() -> None:
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                'tell application "Google Chrome" to activate',
+            ],
+            check=False,
+        )
+    except Exception:  # pragma: no cover
+        pass
 
 
 def build_profile_url(uid: str) -> str:
@@ -110,6 +134,8 @@ def send_friend_request(
     uid: str,
     *,
     headless: bool = False,
+    chrome_user_data_dir: str | None = None,
+    chrome_debugger_address: str | None = None,
 ) -> None:
     try:
         from selenium.common.exceptions import TimeoutException
@@ -121,7 +147,11 @@ def send_friend_request(
             "selenium is not installed. Create a venv and run: .venv/bin/pip install selenium"
         ) from exc
 
-    driver = build_driver(headless=headless)
+    driver = build_driver(
+        headless=headless,
+        chrome_user_data_dir=chrome_user_data_dir,
+        chrome_debugger_address=chrome_debugger_address,
+    )
 
     try:
         login_with_cookies(driver, cookies)
@@ -173,6 +203,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run Chrome in headless mode.",
     )
+    parser.add_argument(
+        "--chrome-user-data-dir",
+        help="Path to a Chrome user data directory to reuse an existing signed-in profile.",
+    )
+    parser.add_argument(
+        "--chrome-debugger-address",
+        help="Debugger address for an already-open Chrome instance, for example 127.0.0.1:9222.",
+    )
     return parser.parse_args()
 
 
@@ -182,7 +220,13 @@ def main() -> None:
     if not cookies:
         raise SystemExit(f"No valid cookies found in {args.cookie_file}")
 
-    send_friend_request(cookies, args.uid, headless=args.headless)
+    send_friend_request(
+        cookies,
+        args.uid,
+        headless=args.headless,
+        chrome_user_data_dir=args.chrome_user_data_dir,
+        chrome_debugger_address=args.chrome_debugger_address,
+    )
 
 
 if __name__ == "__main__":
